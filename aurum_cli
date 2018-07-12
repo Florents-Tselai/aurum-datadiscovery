@@ -1,0 +1,129 @@
+#!/usr/bin/env python
+
+from logging import getLogger
+from os import environ
+from pathlib import Path
+from subprocess import run as run_command
+from urllib.request import urlopen, Request
+
+from fire import Fire
+
+log = getLogger(__name__)
+
+# Aurum-related  | Should be set explicitely
+AURUM_HOME = Path(environ.get('AURUM_HOME', Path.home().joinpath('.aurum').__str__()))
+AURUM_SRC_HOME = Path(environ.get('AURUM_SRC_HOME', Path.home().joinpath('aurum-datadiscovery').__str__()))
+AURUM_ES_HOST = environ.get('AURUM_ES_HOST', 'http://127.0.0.1:9200')
+AURUM_NEO4J_HOST = environ.get('AURUM_NEO4J_HOST', 'http://127.0.0.1:7474')
+
+# Aurum-related | Will most probably be relative
+AURUM_DDPROFILER_HOME = AURUM_SRC_HOME / 'ddprofiler'
+AURUM_DDPROFILER_EXEC = AURUM_DDPROFILER_HOME / 'run.sh'
+
+AURUM_MODELS_DIR = AURUM_HOME.joinpath('models')
+if not AURUM_MODELS_DIR.exists():
+    AURUM_MODELS_DIR.mkdir()
+
+AURUM_SOURCES_DIR = AURUM_HOME.joinpath('sources')
+if not AURUM_SOURCES_DIR.exists():
+    AURUM_SOURCES_DIR.mkdir()
+
+# System-level
+GRADLE_EXEC = '/usr/bin/gradle'
+
+
+class AurumWrapper(object):
+    """
+    This is supposed to wrap around Aurum's current sequence of commands.
+
+    This abstraction will serve as an interface consumed both from a CLI interface and a Web one.
+    For now, it only abstracts the back-and-forth between directories, bash scripts, .yml files edits etc.
+    In time, this will be moved to a separate module and for Aurum v1.0 should not be necessary at all,
+    as we assume that a `python setup.py install` or `make install` will handle those things. (TODO: discuss)
+
+    To make things simple we rely on some Aurum-related environment variables, listed below
+    """
+
+    def __init__(self):
+        pass
+        # TODO pass some of the env vars above
+
+    def clear_es(self):
+        """
+        Removes Aurum-related data from es, by deleting `profile` and `text` indices from ES
+
+        """
+        urlopen(Request(AURUM_ES_HOST + '/profile', method='DELETE'))
+        urlopen(Request(AURUM_ES_HOST + '/text', method='DELETE'))
+
+    ### YML TEMPLATES
+
+    def _write_yml(self, name, payload):
+        fp = AURUM_SOURCES_DIR.joinpath(name + '.yml')
+        with fp.open(mode='w+') as f:
+            f.write(payload)
+        return str(fp)
+
+    def profile_csv(self, name, path, separator=',', api_version=0):
+        """
+        Profiles .csv files living under a directory
+
+        :param name:
+        :param path:
+        :param separator: Must be the same for all files
+        :param api_version:
+        :return:
+        """
+        CSV_YML_TEMPLATE = """api_version: {api_version}
+                    sources:
+
+                    - name: "{name}"
+                      type: csv
+                      config:
+                          path: "{path}"
+                          separator: '{separator}'
+                    """
+        source_fp = self._write_yml(name=name, payload=CSV_YML_TEMPLATE.format(name=name,
+                                                                               path=path,
+                                                                               separator=separator,
+                                                                               api_version=api_version
+                                                                               )git
+                                    )
+        run_command(['ls', '-l', AURUM_SOURCES_DIR.__str__()])
+        run_command([AURUM_DDPROFILER_EXEC.__str__(), '--sources', source_fp])
+
+    def profile_sqlserver(self, name, db_server_ip, db_server_port, database_name, db_username, db_password):
+        """
+        Profiles a MS SQL Server database
+
+        :param name:
+        :param db_server_ip:
+        :param db_server_port:
+        :param database_name:
+        :param db_username:
+        :param db_password:
+        :return:
+        """
+        pass
+
+    def profile(self, data_source_type, separator):
+        """
+
+        Args:
+            data_source_type: One of 'csv', 'postgres', 'oracle', 'mssqlserver'
+            sql_query: Query to be run against the DB (not applicable if data_source_type=csv
+            separator: '|' applicable only if data_source_type=csv
+
+        Returns:
+            Nada
+        """
+        assert data_source_type.lower() in ['csv', 'postgres', 'oracle', 'mssqlserver']
+        print('Profiling source type %s' % data_source_type)
+
+
+class AurumCLI(AurumWrapper):
+    pass
+
+
+if __name__ == '__main__':
+    Fire(AurumCLI)
