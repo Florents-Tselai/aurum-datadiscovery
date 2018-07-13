@@ -87,7 +87,7 @@ class AurumWrapper(object):
                                                                                path=path,
                                                                                separator=separator,
                                                                                api_version=api_version
-                                                                               )git
+                                                                               )
                                     )
         run_command(['ls', '-l', AURUM_SOURCES_DIR.__str__()])
         run_command([AURUM_DDPROFILER_EXEC.__str__(), '--sources', source_fp])
