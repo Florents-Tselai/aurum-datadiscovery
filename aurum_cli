@@ -1,9 +1,11 @@
 #!/usr/bin/env python
 
+from abc import ABC, abstractmethod
 from logging import getLogger
 from os import environ
 from pathlib import Path
 from subprocess import run as run_command
+from typing import NamedTuple
 from urllib.request import urlopen, Request
 
 from fire import Fire
@@ -119,6 +121,101 @@ class AurumWrapper(object):
         """
         assert data_source_type.lower() in ['csv', 'postgres', 'oracle', 'mssqlserver']
         print('Profiling source type %s' % data_source_type)
+
+
+""" Model - DataSources """
+
+
+class AurumDataSource(NamedTuple):
+    name: str = 'Default Aurum Data Source Name'
+
+
+class CSVDataSource(AurumDataSource):
+    separator: str = ','
+    file_path: [Path, str] = None
+
+
+class RDBMSDataSource(AurumDataSource):
+    pass
+
+
+class AurumProfileJob(object):
+    # TODO: subclass rq.Job
+    pass
+
+
+class AurumAPIBase(ABC):
+    """
+    Abstract Class
+
+    High - level API for Aurum's primitive operations
+    - manage data sources (DS), profile them (DS) and run discovery queries.
+    Implementation depends mainly on the way we store metadata.
+    Currently we have a kind of `class YMLBackedAPI(AurumAPIBase)` and we'll
+    gradually move to a `class SQLiteBackedAPI(AurumAPIBase)`
+
+    For simplicity we keep it in a single class for now - will be split eventually
+    """
+
+    # PART 0: MANAGE DATA SOURCES
+
+    @abstractmethod
+    def add_data_source(self, ds: AurumDataSource):
+        # TODO add another function that adds DS without dependency injection
+        pass
+
+    @abstractmethod
+    def _store_data_source(self, ds: AurumDataSource):
+        """
+        Store DS metadata to a permanent storage (e.g. SQLite or YML file)
+
+        :param ds:
+        :return:
+        """
+        pass
+
+    @abstractmethod
+    def fetch_data_source(self, ds_name: str) -> AurumDataSource:
+        pass
+
+    @abstractmethod
+    @property
+    def data_sources(self) -> list:
+        """
+        Returns a list of the available DataSources
+
+        :return:
+        """
+        pass
+
+    # PART 1: PROFILING
+    @abstractmethod
+    def profile(self, ds_name: str, selection_query=None) -> AurumProfileJob:
+        """
+
+        :param ds_name:
+        :param selection_query: A list of column names in case of CSV DS or SQL query in case of RDBMS one
+        :return:
+        """
+        pass
+
+    # PART 2: MODEL BUILDING
+
+    # PART 3: DISCOVERY QUERIES
+
+
+class YMLBackedAPI(AurumAPIBase):
+    """
+    Implementation replicating the existing workflow
+    """
+    pass
+
+
+class SQLiteBackedAPI(AurumAPIBase):
+    """
+    Implementation backed by an SQLite instance
+    """
+    pass
 
 
 class AurumCLI(AurumWrapper):
