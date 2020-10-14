@@ -14,6 +14,13 @@ from tqdm import tqdm
 from knowledgerepr import fieldnetwork
 from modelstore.elasticstore import StoreHandler
 import time
+from DoD import view_4c_analysis_baseline as v4c
+import os
+import pandas as pd
+import pprint
+
+
+pp = pprint.PrettyPrinter(indent=4)
 
 
 class DoD:
@@ -69,15 +76,18 @@ class DoD:
             filter_id += 1
         return filter_drs
 
-    def virtual_schema_iterative_search(self, list_attributes: [str], list_samples: [str], max_hops=2, debug_enumerate_all_jps=False):
+    def virtual_schema_iterative_search(self, list_attributes: [str], list_samples: [str], perf_stats, max_hops=2, debug_enumerate_all_jps=False):
         # Align schema definition and samples
+        st_stage1 = time.time()
         assert len(list_attributes) == len(list_samples)
         sch_def = {attr: value for attr, value in zip(list_attributes, list_samples)}
 
         sch_def = OrderedDict(sorted(sch_def.items(), key=lambda x: x[0], reverse=True))
 
         filter_drs = self.joint_filters(sch_def)
-
+        et_stage1 = time.time()
+        perf_stats['t_stage1'] = (et_stage1 - st_stage1)
+        st_stage2 = time.time()
         # We group now into groups that convey multiple filters.
         # Obtain list of tables ordered from more to fewer filters.
         table_fulfilled_filters = defaultdict(list)
@@ -186,9 +196,36 @@ class DoD:
                     yield (candidate_group, candidate_group_filters_covered)
                 go_on = False  # finished exploring all groups
 
+        # """
+        # # FIXME: obtaining pairs of tables to join?
+        # """
+        # all_pairs = 0
+        # candidate_groups = 0
+        # for cg, _ in eager_candidate_exploration():
+        #     candidate_groups += 1
+        #     all_pairs += len([el for el in list(itertools.combinations(cg, 2))])
+        #     # all_pairs_to_join = [len([el for el in list(itertools.combinations(group_tables, 2))])
+        #     #                  for group_tables in all_candidate_groups]
+        #     # all_pairs += all_pairs_to_join[0]
+        # # print([el for el in all_candidate_groups])
+        # # print("all pairs to join: " + str(all_pairs))
+        # print("CG: " + str(candidate_groups))
+        # print("TOTAL: " + str(all_pairs))
+        # exit()
+        # """
+        # # FIXME
+        # """
+
+        et_stage2 = time.time()
+        perf_stats['t_stage2'] = (et_stage2 - st_stage2)
         # Find ways of joining together each group
         cache_unjoinable_pairs = defaultdict(int)
+        perf_stats['time_joinable'] = 0
+        perf_stats['time_is_materializable'] = 0
+        perf_stats['time_materialize'] = 0
+        num_candidate_groups = 0
         for candidate_group, candidate_group_filters_covered in eager_candidate_exploration():
+            num_candidate_groups += 1
             print("")
             print("Candidate group: " + str(candidate_group))
             num_unique_filters = len({f_id for _, _, f_id in candidate_group_filters_covered})
@@ -197,12 +234,16 @@ class DoD:
             if len(candidate_group) == 1:
                 table = candidate_group[0]
                 path = table_path[table]
-                materialized_virtual_schema = dpu.get_dataframe(path + "/" + table)
+                # materialized_virtual_schema = dpu.get_dataframe(path + "/" + table)
+                materialized_virtual_schema = dpu.read_relation(path + "/" + table)
                 attrs_to_project = dpu.obtain_attributes_to_project(candidate_group_filters_covered)
                 # Create metadata to document this view
                 view_metadata = dict()
                 view_metadata["#join_graphs"] = 1
                 view_metadata["join_graph"] = {"nodes": [{"id": -101010, "label": table}], "edges": []}
+                if 'single_relation_group' not in perf_stats:
+                    perf_stats['single_relation_group'] = 0
+                perf_stats['single_relation_group'] += 1
                 yield materialized_virtual_schema, attrs_to_project, view_metadata
                 continue  # to go to the next group
 
@@ -211,7 +252,10 @@ class DoD:
             #group_with_all_relations, join_path_groups = self.joinable(candidate_group, cache_unjoinable_pairs)
             max_hops = max_hops
             # We find the different join graphs that would join the candidate_group
+            st_joinable = time.time()
             join_graphs = self.joinable(candidate_group, cache_unjoinable_pairs, max_hops=max_hops)
+            et_joinable = time.time()
+            perf_stats['time_joinable'] += (et_joinable - st_joinable)
             if debug_enumerate_all_jps:
                 for i, group in enumerate(join_graphs):
                     print("Group: " + str(i))
@@ -221,13 +265,23 @@ class DoD:
 
             # if not graphs skip next
             if len(join_graphs) == 0:
+                if 'unjoinable_candidate_group' not in perf_stats:
+                    perf_stats['unjoinable_candidate_group'] = 0
+                perf_stats['unjoinable_candidate_group'] += 1
                 print("Group: " + str(candidate_group) + " is Non-Joinable with max_hops=" + str(max_hops))
                 continue
+            if 'joinable_candidate_group' not in perf_stats:
+                perf_stats['joinable_candidate_group'] = 0
+            perf_stats['joinable_candidate_group'] += 1
+            if 'num_join_graphs_per_candidate_group' not in perf_stats:
+                perf_stats['num_join_graphs_per_candidate_group'] = []
+            perf_stats['num_join_graphs_per_candidate_group'].append(len(join_graphs))
 
             # Now we need to check every join graph individually and see if it's materializable. Only once we've
             # exhausted these join graphs we move on to the next candidate group. We know already that each of the
             # join graphs covers all tables in candidate_group, so if they're materializable we're good.
-            # materializable_join_graphs = []
+            total_materializable_join_graphs = 0
+            materializable_join_graphs = []
             for jpg in join_graphs:
                 # Obtain filters that apply to this join graph
                 filters = set()
@@ -239,18 +293,37 @@ class DoD:
 
                 # TODO: obtain join_graph score for diff metrics. useful for ranking later
                 # rank_materializable_join_graphs(materializable_join_paths, table_path, dod)
-                is_join_graph_valid = self.is_join_graph_materializable(jpg, table_fulfilled_filters)
-
+                st_is_materializable = time.time()
+                # if query view is all attributes, then it's always materializable or we could
+                # join on a small sample and see -- we can have 2 different impls.
+                if sum([0] + [1 for el in list_samples if el != '']) > 0:
+                    is_join_graph_valid = self.is_join_graph_materializable(jpg, table_fulfilled_filters)
+                else:
+                    is_join_graph_valid = True
+                et_is_materializable = time.time()
+                perf_stats['time_is_materializable'] += (et_is_materializable - st_is_materializable)
+                # Obtain all materializable graphs, then materialize
                 if is_join_graph_valid:
-                    attrs_to_project = dpu.obtain_attributes_to_project(filters)
-                    materialized_virtual_schema = dpu.materialize_join_graph(jpg, self)
-                    # Create metadata to document this view
-                    view_metadata = dict()
-                    view_metadata["#join_graphs"] = len(join_graphs)
-                    # view_metadata["join_graph"] = self.format_join_paths_pairhops(jpg)
-                    view_metadata["join_graph"] = self.format_join_graph_into_nodes_edges(jpg)
-                    yield materialized_virtual_schema, attrs_to_project, view_metadata
+                    total_materializable_join_graphs += 1
+                    materializable_join_graphs.append((jpg, filters))
+            # At this point we can empty is-join-graph-materializable cache and create a new one
+            # dpu.empty_relation_cache()  # TODO: If df.copy() works, then this is a nice reuse
+            st_materialize = time.time()
+            to_return = self.materialize_join_graphs(materializable_join_graphs)
+            et_materialize = time.time()
+            perf_stats['time_materialize'] += (et_materialize - st_materialize)
+            # yield to_return
+            for el in to_return:
+                if 'actually_materialized' not in perf_stats:
+                    perf_stats['actually_materialized'] = 0
+                perf_stats['actually_materialized'] += 1
+                yield el
 
+            if 'materializable_join_graphs' not in perf_stats:
+                perf_stats['materializable_join_graphs'] = []
+            perf_stats['materializable_join_graphs'].append(total_materializable_join_graphs)
+
+        perf_stats["num_candidate_groups"] = num_candidate_groups
         print("Finished enumerating groups")
         cache_unjoinable_pairs = OrderedDict(sorted(cache_unjoinable_pairs.items(),
                                                     key=lambda x: x[1], reverse=True))
@@ -262,8 +335,35 @@ class DoD:
         for hop_l, hop_r in join_graph:
             all_nids.append(hop_r.nid)
             all_nids.append(hop_l.nid)
+        path_id = sum([hash(el) for el in all_nids])
+        return path_id
+
+    def __compute_join_graph_id(self, join_graph):
+        all_nids = []
+        for hop_l, hop_r in join_graph:
+            all_nids.append(hop_r.nid)
+            all_nids.append(hop_l.nid)
         path_id = frozenset(all_nids)
         return path_id
+
+    def materialize_join_graphs(self, materializable_join_graphs):
+        to_return = []
+        for mjg, filters in materializable_join_graphs:
+            # if is_join_graph_valid:
+            attrs_to_project = dpu.obtain_attributes_to_project(filters)
+            # continue  # test
+            materialized_virtual_schema = dpu.materialize_join_graph_sample(mjg, self, sample_size=1000)
+            # materialized_virtual_schema = dpu.materialize_join_graph(mjg, self)
+            if materialized_virtual_schema is False:
+                continue  # happens when the join was an outlier
+            # Create metadata to document this view
+            view_metadata = dict()
+            view_metadata["#join_graphs"] = len(materializable_join_graphs)
+            # view_metadata["join_graph"] = self.format_join_paths_pairhops(jpg)
+            view_metadata["join_graph"] = self.format_join_graph_into_nodes_edges(mjg)
+            to_return.append((materialized_virtual_schema, attrs_to_project, view_metadata))
+            # yield materialized_virtual_schema, attrs_to_project, view_metadata
+        return to_return
 
     def joinable(self, group_tables: [str], cache_unjoinable_pairs: defaultdict(int), max_hops=2):
         """
@@ -282,29 +382,33 @@ class DoD:
         # for each pair of tables in group keep list of (path, tables_covered)
         paths_per_pair = defaultdict(list)
 
-        for table1, table2 in itertools.combinations(group_tables, 2):
+        table_combinations = [el for el in itertools.combinations(group_tables, 2)]
+
+        for table1, table2 in tqdm(table_combinations):
             # Check if tables are already known to be unjoinable
             if (table1, table2) in cache_unjoinable_pairs.keys() or (table2, table1) in cache_unjoinable_pairs.keys():
-                continue
+                continue  # FIXME FIXME FIXME
             t1 = self.aurum_api.make_drs(table1)
             t2 = self.aurum_api.make_drs(table2)
             t1.set_table_mode()
             t2.set_table_mode()
             # Check cache first, if not in cache then do the search
-            drs = self.are_paths_in_cache(table1, table2)
-            if drs is None:
+            # drs = self.are_paths_in_cache(table1, table2)
+            paths = self.are_paths_in_cache(table1, table2)  # list of lists
+            if paths is None:
                 print("Finding paths between " + str(table1) + " and " + str(table2))
                 print("max hops: " + str(max_hops))
                 s = time.time()
-                drs = self.aurum_api.paths(t1, t2, Relation.PKFK, max_hops=max_hops)
+                drs = self.aurum_api.paths(t1, t2, Relation.PKFK, max_hops=max_hops, lean_search=True)
                 e = time.time()
                 print("Total time: " + str((e-s)))
-                self.place_paths_in_cache(table1, table2, drs)
-            paths = drs.paths()  # list of lists
+                paths = drs.paths()  # list of lists
+                self.place_paths_in_cache(table1, table2, paths)  # FIXME FIXME FIXME
+            # paths = drs.paths()  # list of lists
             # If we didn't find paths, update unjoinable_pairs cache with this pair
-            if len(paths) == 0:  # then store this info, these tables do not join
-                cache_unjoinable_pairs[(table1, table2)] += 1
-                cache_unjoinable_pairs[(table2, table1)] += 1
+            if len(paths) == 0:  # then store this info, these tables do not join # FIXME FIXME FIXME
+                cache_unjoinable_pairs[(table1, table2)] += 1  # FIXME FIXME
+                cache_unjoinable_pairs[(table2, table1)] += 1  # FIXME FIXME FIXME
             for p in paths:
                 tables_covered = set()
                 tables_in_group = set(group_tables)
@@ -411,17 +515,19 @@ class DoD:
                     filtered_l = None
                     for info, filter_type, filter_id in filters_l:
                         if filter_type == FilterType.ATTR:
-                            filtered_l = dpu.read_relation(l_path + l.source_name)
+                            filtered_l = dpu.read_relation_on_copy(l_path + l.source_name)  # FIXME FIXME FIXME
+                            # filtered_l = dpu.get_dataframe(l_path + l.source_name)
                             continue  # no need to filter anything if the filter is only attribute type
                         attribute = info[1]
                         cell_value = info[0]
-                        filtered_l = dpu.apply_filter(l_path + l.source_name, attribute, cell_value)
+                        filtered_l = dpu.apply_filter(l_path + l.source_name, attribute, cell_value)# FIXME FIXME FIXME
 
                     if len(filtered_l) == 0:
                         return False  # filter does not leave any data => non-joinable
                 # If there are not filters, then do not apply them
                 else:
-                    filtered_l = dpu.read_relation(l_path + l.source_name)
+                    filtered_l = dpu.read_relation_on_copy(l_path + l.source_name)# FIXME FIXME FIXME
+                    # filtered_l = dpu.get_dataframe(l_path + l.source_name)
             else:
                 filtered_l = local_intermediates[l.source_name]
             local_intermediates[l.source_name] = filtered_l
@@ -435,7 +541,8 @@ class DoD:
                     filtered_r = None
                     for info, filter_type, filter_id in filters_r:
                         if filter_type == FilterType.ATTR:
-                            filtered_r = dpu.read_relation(r_path + r.source_name)
+                            filtered_r = dpu.read_relation_on_copy(r_path + r.source_name)# FIXME FIXME FIXME
+                            # filtered_r = dpu.get_dataframe(r_path + r.source_name)
                             continue  # no need to filter anything if the filter is only attribute type
                         attribute = info[1]
                         cell_value = info[0]
@@ -445,7 +552,8 @@ class DoD:
                         return False  # filter does not leave any data => non-joinable
                 # If there are not filters, then do not apply them
                 else:
-                    filtered_r = dpu.read_relation(r_path + r.source_name)
+                    filtered_r = dpu.read_relation_on_copy(r_path + r.source_name)# FIXME FIXME FIXME
+                    # filtered_r = dpu.get_dataframe(r_path + r.source_name)
             else:
                 filtered_r = local_intermediates[r.source_name]
             local_intermediates[r.source_name] = filtered_r
@@ -550,51 +658,16 @@ def obtain_table_paths(set_nids, dod):
     return table_path
 
 
-def test_e2e(dod, number_jps=5, output_path=None, full_view=True, interactive=True):
+def test_e2e(dod, attrs, values, number_jps=5, output_path=None, full_view=False, interactive=False):
 
-    # tests equivalence and containment - did not finish executing though
-    # attrs = ["Mit Id", "Krb Name", "Hr Org Unit Title"]
-    # values = ["968548423", "kimball", "Mechanical Engineering"]
-
-    # # cannot search for numbers
-    # attrs = ["s_name", "s_address", "ps_availqty"]
-    # values = ["Supplier#000000001", "N kD4on9OM Ipw3,gf0JBoQDd7tgrzrddZ", "7340"]
-
-    attrs = ["s_name", "s_address", "ps_comment"]
-    values = ["Supplier#000000001", "N kD4on9OM Ipw3,gf0JBoQDd7tgrzrddZ",
-              "dly final packages haggle blithely according to the pending packages. slyly regula"]
-
-    # attrs = ["n_name", "s_name", "c_name", "o_clerk"]
-    # values = ["CANADA", "Supplier#000000013", "Customer#000000005", "Clerk#000000400"]
-
-    # attrs = ["o_clerk", "o_orderpriority", "n_name"]
-    # values = ["Clerk#000000951", "5-LOW", "JAPAN"]
-
-    # attrs = ["Subject", "Title", "Publisher"]
-    # values = ["", "Man who would be king and other stories", "Oxford university press, incorporated"]
-
-    # attrs = ["Iap Category Name", "Person Name", "Person Email"]
-    # # values = ["", "Meghan Kenney", "mkenney@mit.edu"]
-    # values = ["Engineering", "", ""]
-
-    # attrs = ["Building Name Long", "Ext Gross Area", "Building Room", "Room Square Footage"]
-    # values = ["", "", "", ""]
-
-    # attrs = ["c_name", "c_phone", "n_name", "l_tax"]
-    # values = ["Customer#000000001", "25-989-741-2988", "BRAZIL", ""]
-
-    # attrs = ["Last Name", "Building Name", "Bldg Gross Square Footage", "Department Name"]
-    # values = ["Madden", "Ray and Maria Stata Center", "", "Dept of Electrical Engineering & Computer Science"]
-
-    # attrs = ["Neighborhood ", "Total Population ", "Graduate Degree %"]
-    # values = ["Cambridgeport", "", ""]
-
-    # tests equivalence and containment
-    # attrs = ["Email Address", "Department Full Name"]
-    # values = ["madden@csail.mit.edu", ""]
-
+    ###
+    # Run Core DoD
+    ###
+    view_metadata_mapping = dict()
     i = 0
-    for mjp, attrs_project, metadata in dod.virtual_schema_iterative_search(attrs, values,
+    perf_stats = dict()
+    st_runtime = time.time()
+    for mjp, attrs_project, metadata in dod.virtual_schema_iterative_search(attrs, values, perf_stats, max_hops=2,
                                                         debug_enumerate_all_jps=False):
         print("JP: " + str(i))
         # i += 1
@@ -604,20 +677,72 @@ def test_e2e(dod, number_jps=5, output_path=None, full_view=True, interactive=Tr
 
         proj_view = dpu.project(mjp, attrs_project)
 
-        print(str(proj_view.head(10)))
-        print("Metadata")
-        print(metadata)
+        # print(str(proj_view.head(5)))
+        # print("Metadata")
+        # print(metadata)
 
         if output_path is not None:
+            view_path = None
             if full_view:
-                mjp.to_csv(output_path + "/raw_view_" + str(i), encoding='latin1', index=False)
-            proj_view.to_csv(output_path + "/view_" + str(i), encoding='latin1', index=False)  # always store this
+                view_path = output_path + "/raw_view_" + str(i)
+                mjp.to_csv(view_path, encoding='latin1', index=False)
+            view_path = output_path + "/view_" + str(i)
+            proj_view.to_csv(view_path, encoding='latin1', index=False)  # always store this
+            # store metadata associated to that view
+            view_metadata_mapping[view_path] = metadata
 
         i += 1
 
         if interactive:
             print("")
             input("Press any key to continue...")
+    et_runtime = time.time()
+    perf_stats['runtime'] = (et_runtime - st_runtime)
+    pp.pprint(perf_stats)
+    if 'num_join_graphs_per_candidate_group' in perf_stats:
+        total_join_graphs = sum(perf_stats['num_join_graphs_per_candidate_group'])
+        print("Total join graphs: " + str(total_join_graphs))
+    if 'materializable_join_graphs' in perf_stats:
+        total_materializable_join_graphs = sum(perf_stats['materializable_join_graphs'])
+        print("Total materializable join graphs: " + str(total_materializable_join_graphs))
+
+    print("Total views: " + str(i))
+    exit()
+
+    ###
+    # Run 4C
+    ###
+    # return
+    groups_per_column_cardinality = v4c.main(output_path)
+
+    for k, v in groups_per_column_cardinality.items():
+        compatible_groups = v['compatible']
+        contained_groups = v['contained']
+        complementary_group = v['complementary']
+        contradictory_group = v['contradictory']
+
+        print("Compatible views: " + str(len(compatible_groups)))
+        print("Contained views: " + str(len(contained_groups)))
+        print("Complementary views: " + str(len(complementary_group)))
+        print("Contradictory views: " + str(len(contradictory_group)))
+
+        # for path1, key_column, key_value, path2 in contradictory_group[:2]:
+        #     df1 = pd.read_csv(path1)
+        #     df2 = pd.read_csv(path2)
+        #     row1 = df1[df1[key_column] == key_value]
+        #     row2 = df2[df2[key_column] == key_value]
+        #     print(path1 + " - " + path2)
+        #     print("ROW - 1")
+        #     print(view_metadata_mapping[path1])
+        #     print(row1)
+        #     print("ROW - 2")
+        #     print(view_metadata_mapping[path2])
+        #     print(row2)
+        #     print("")
+        #     print("")
+
+    # We can now link classified views with their metadata
+
 
 
 # def test_joinable(dod):
@@ -709,25 +834,124 @@ def pe_paths(dod):
 if __name__ == "__main__":
     print("DoD")
 
-    # basic test
+    ###
+    ## Setup DoD
+    ###
     # path_to_serialized_model = "/Users/ra-mit/development/discovery_proto/models/tpch/"
-    path_to_serialized_model = "/Users/ra-mit/development/discovery_proto/models/mitdwh/"
+    # path_to_serialized_model = "/Users/ra-mit/development/discovery_proto/models/mitdwh/"
     # path_to_serialized_model = "/Users/ra-mit/development/discovery_proto/models/debug_sb_bug/"
     # path_to_serialized_model = "/Users/ra-mit/development/discovery_proto/models/massdata/"
-    sep = ","
+    path_to_serialized_model = "/Users/ra-mit/development/discovery_proto/models/chembl_and_drugcentral/"
+    # sep = ","
     # sep = "|"
+    sep = ";"
     store_client = StoreHandler()
     network = fieldnetwork.deserialize_network(path_to_serialized_model)
-
     dod = DoD(network=network, store_client=store_client, csv_separator=sep)
 
-    # Fclt_building_list.csv and short_course_catalog_subject_offered.csv
-    pe_paths(dod)
+    ###
+    ## Query Views
+    ###
+
+    ### TPCH
+
+    # # cannot search for numbers
+    # attrs = ["s_name", "s_address", "ps_availqty"]
+    # values = ["Supplier#000000001", "N kD4on9OM Ipw3,gf0JBoQDd7tgrzrddZ", "7340"]
+
+    # attrs = ["s_name", "s_address", "ps_comment"]
+    # values = ["Supplier#000000001", "N kD4on9OM Ipw3,gf0JBoQDd7tgrzrddZ",
+    #           "dly final packages haggle blithely according to the pending packages. slyly regula"]
+
+    # attrs = ["n_name", "s_name", "c_name", "o_clerk"]
+    # values = ["CANADA", "Supplier#000000013", "Customer#000000005", "Clerk#000000400"]
+
+    # attrs = ["o_clerk", "o_orderpriority", "n_name"]
+    # values = ["Clerk#000000951", "5-LOW", "JAPAN"]
+
+    # attrs = ["c_name", "c_phone", "n_name", "l_tax"]
+    # values = ["Customer#000000001", "25-989-741-2988", "BRAZIL", ""]
+
+    ## MIT DWH
+
+    # tests equivalence and containment - did not finish executing though (out of memory)
+    # attrs = ["Mit Id", "Krb Name", "Hr Org Unit Title"]
+    # values = ["968548423", "kimball", "Mechanical Engineering"]
+
+    # attrs = ["Subject", "Title", "Publisher"]
+    # values = ["", "Man who would be king and other stories", "Oxford university press, incorporated"]
+
+    # EVAL - ONE
+    # attrs = ["Iap Category Name", "Person Name", "Person Email"]
+    # # values = ["", "Meghan Kenney", "mkenney@mit.edu"]
+    # values = ["Engineering", "", ""]
+
+    # EVAL - TWO
+    # attrs = ["Building Name Long", "Ext Gross Area", "Building Room", "Room Square Footage"]
+    # values = ["", "", "", ""]
+
+    # EVAL - THREE
+    # attrs = ["Last Name", "Building Name", "Bldg Gross Square Footage", "Department Name"]
+    # values = ["Madden", "Ray and Maria Stata Center", "", "Dept of Electrical Engineering & Computer Science"]
+
+    # EVAL - FOUR
+    # tests equivalence and containment
+    # attrs = ["Email Address", "Department Full Name"]
+    # values = ["madden@csail.mit.edu", ""]
+
+    # EVAL - FIVE
+    # attrs = ["Last Name", "Building Name", "Bldg Gross Square Footage", "Department Name"]
+    # values = ["", "", "", ""]
+
+    ## MASSDATA
+
+    # ONE (3 + 4)
+    # attrs = ["Neighborhood ", "Total Population ", "Graduate Degree %"]
+    # values = ["Cambridgeport", "", ""]
+
+    #
+    # attrs = ['CASE_TITLE', 'SUBJECT', 'Graduate Degree %']
+    # values = ['', 'Public Works Department', '']
+
+    ## CHEMBL22
+
+    # ONE (12)
+    attrs = ['assay_test_type', 'assay_category', 'journal', 'year', 'volume']
+    values = ['', '', '', '', '']
+
+    # TWO (27)
+    # attrs = ['accession', 'sequence', 'organism', 'start_position', 'end_position']
+    # values = ['O09028', '', 'Rattus norvegicus', '', '']
+
+    # THREE (50)
+    # attrs = ['ref_type', 'ref_url', 'enzyme_name', 'organism']
+    # values = ['', '', '', '']
+
+    # FOUR (54)
+    # attrs = ['hba', 'hbd', 'parenteral', 'topical']
+    # values = ['', '', '', '']
+
+    # FIVE (100-)
+    # attrs = ['accession', 'sequence', 'organism', 'start_position', 'end_position']
+    # values = ['', '', '', '', '']
+
+    output_path = "/Users/ra-mit/development/discovery_proto/data/dod/test/"
+
+    # remove all files in test
+    for f in os.listdir(output_path):
+        f_path = os.path.join(output_path, f)
+        try:
+            if os.path.isfile(f_path):
+                os.unlink(f_path)
+        except Exception as e:
+            print(e)
 
     # test_e2e(dod, number_jps=10, output_path=None, interactive=False)
-    # test_e2e(dod, number_jps=10, output_path="/Users/ra-mit/development/discovery_proto/data/dod/")
+    # output_path = None
+    test_e2e(dod, attrs, values, number_jps=10, output_path=output_path)
 
     # debug intree mat join
     # test_intree(dod)
 
     # test_joinable(dod)
+
